@@ -532,15 +532,15 @@ jobs:
             rm -rf "$CODEX_HOME"
           }
           trap cleanup_codex_home EXIT
-          if [ -n "${OPENAI_API_KEY:-}" ]; then
-            printf '%s' "$OPENAI_API_KEY" | npx -y @openai/codex@0 login --with-api-key || true
-          elif [ -n "${CODEX_AUTH_JSON_B64:-}" ]; then
+          if [ -n "${CODEX_AUTH_JSON_B64:-}" ]; then
             if ! printf '%s' "$CODEX_AUTH_JSON_B64" | base64 -d > "$CODEX_HOME/auth.json"; then
               echo "::error::CODEX_AUTH_JSON_B64 is not valid base64."
               echo "1" > codex-exit-code.txt
               exit 1
             fi
             chmod 600 "$CODEX_HOME/auth.json"
+          elif [ -n "${OPENAI_API_KEY:-}" ]; then
+            printf '%s' "$OPENAI_API_KEY" | npx -y @openai/codex@0 login --with-api-key || true
           else
             echo "::error::Codex backend requested, but no Codex credential is configured."
             echo "1" > codex-exit-code.txt
