@@ -558,10 +558,13 @@ jobs:
           rm -f recap-source.json recap-url.txt recap-url-reason.txt codex-events.jsonl codex-stderr.log
           run_codex() {
             set +e
-            npx -y @openai/codex@0 "${CODEX_ARGS[@]}" --json "$(cat recap-prompt.md)" 2> codex-stderr.log | tee codex-events.jsonl
+            timeout 12m npx -y @openai/codex@0 "${CODEX_ARGS[@]}" --json "$(cat recap-prompt.md)" 2> codex-stderr.log | tee codex-events.jsonl
             CODEX_STATUS="${PIPESTATUS[0]}"
             set -e
             echo "$CODEX_STATUS" > codex-exit-code.txt
+            if [ "$CODEX_STATUS" = "124" ]; then
+              echo "::warning::Codex visual recap run timed out after 12 minutes; falling back to deterministic recap source if needed."
+            fi
           }
           run_codex
           # Retry once if the agent exited without writing recap-source.json
