@@ -1,6 +1,6 @@
-name: PR Visual Recap (reusable)
+name: Visual Recap
 
-# Reusable version of pr-visual-recap.yml.  Consumer repos reference this
+# Reusable visual recap workflow.  Consumer repos reference this
 # workflow via `uses:` instead of copying the full ~360-line YAML.  Fixes and
 # improvements land here first and reach every caller automatically.
 #
@@ -8,7 +8,7 @@ name: PR Visual Recap (reusable)
 #
 #   jobs:
 #     visual-recap:
-#       uses: BuilderIO/agent-native/.github/workflows/pr-visual-recap-reusable.yml@main
+#       uses: studios-neptune/agent-native-workflows/.github/workflows/visual-recap.yml@main
 #       secrets:
 #         PLAN_RECAP_TOKEN: ${{ secrets.PLAN_RECAP_TOKEN }}
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
