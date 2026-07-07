@@ -12,6 +12,8 @@ name: PR Visual Recap (reusable)
 #       secrets:
 #         PLAN_RECAP_TOKEN: ${{ secrets.PLAN_RECAP_TOKEN }}
 #         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+#         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+#         CODEX_AUTH_JSON_B64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
 #
 # IMPORTANT: callers must trigger on the same pull_request event types as this
 # file declares in its on.workflow_call section (opened, synchronize, reopened,
@@ -80,8 +82,13 @@ on:
       # Required for the default claude backend; optional when agent=codex.
       ANTHROPIC_API_KEY:
         required: false
-      # Required when agent=codex; ignored otherwise.
+      # Required when agent=codex unless CODEX_AUTH_JSON_B64 is configured;
+      # ignored otherwise.
       OPENAI_API_KEY:
+        required: false
+      # Optional when agent=codex. Base64-encoded Codex auth.json cache used
+      # when API-key login is unavailable.
+      CODEX_AUTH_JSON_B64:
         required: false
       # Override only when self-hosting the Plan app at a non-default origin.
       # Must match the plan-url input origin.
@@ -111,6 +118,7 @@ jobs:
           HAS_PLAN: ${{ secrets.PLAN_RECAP_TOKEN != '' }}
           HAS_ANTHROPIC: ${{ secrets.ANTHROPIC_API_KEY != '' }}
           HAS_OPENAI: ${{ secrets.OPENAI_API_KEY != '' }}
+          HAS_CODEX_AUTH_JSON: ${{ secrets.CODEX_AUTH_JSON_B64 != '' }}
           AGENT: ${{ inputs.agent }}
           VISUAL_RECAP_MODEL: ${{ inputs.model }}
           VISUAL_RECAP_SKILL_SOURCE: ${{ inputs.skill-source || 'auto' }}
@@ -153,7 +161,9 @@ jobs:
             if (agent !== 'claude' && agent !== 'codex') {
               reasons.push(`unsupported agent input "${process.env.AGENT}" (expected "claude" or "codex")`);
             } else if (agent === 'codex') {
-              if (process.env.HAS_OPENAI !== 'true') reasons.push('OPENAI_API_KEY not configured (codex backend)');
+              if (process.env.HAS_OPENAI !== 'true' && process.env.HAS_CODEX_AUTH_JSON !== 'true') {
+                reasons.push('OPENAI_API_KEY or CODEX_AUTH_JSON_B64 not configured (codex backend)');
+              }
             } else {
               if (process.env.HAS_ANTHROPIC !== 'true') reasons.push('ANTHROPIC_API_KEY not configured (claude backend)');
             }
@@ -511,9 +521,32 @@ jobs:
         continue-on-error: true
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          CODEX_AUTH_JSON_B64: ${{ secrets.CODEX_AUTH_JSON_B64 }}
         run: |
           set -uo pipefail
-          printenv OPENAI_API_KEY | npx -y @openai/codex@0 login --with-api-key || true
+          export CODEX_HOME="$RUNNER_TEMP/codex-home"
+          rm -rf "$CODEX_HOME"
+          mkdir -p "$CODEX_HOME"
+          chmod 700 "$CODEX_HOME"
+          cleanup_codex_home() {
+            rm -rf "$CODEX_HOME"
+          }
+          trap cleanup_codex_home EXIT
+          if [ -n "${OPENAI_API_KEY:-}" ]; then
+            printf '%s' "$OPENAI_API_KEY" | npx -y @openai/codex@0 login --with-api-key || true
+          elif [ -n "${CODEX_AUTH_JSON_B64:-}" ]; then
+            if ! printf '%s' "$CODEX_AUTH_JSON_B64" | base64 -d > "$CODEX_HOME/auth.json"; then
+              echo "::error::CODEX_AUTH_JSON_B64 is not valid base64."
+              echo "1" > codex-exit-code.txt
+              exit 1
+            fi
+            chmod 600 "$CODEX_HOME/auth.json"
+          else
+            echo "::error::Codex backend requested, but no Codex credential is configured."
+            echo "1" > codex-exit-code.txt
+            exit 1
+          fi
+          unset OPENAI_API_KEY CODEX_AUTH_JSON_B64
           CODEX_ARGS=(exec --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check)
           if [ -n "${VISUAL_RECAP_MODEL:-}" ]; then CODEX_ARGS+=(--model "$VISUAL_RECAP_MODEL"); fi
           case "${VISUAL_RECAP_REASONING:-}" in
@@ -538,6 +571,99 @@ jobs:
             sleep 5
             run_codex
           fi
+
+      - name: Ensure recap source exists
+        id: fallback_source
+        if: steps.diff.outputs.tiny != 'true' && steps.route_health.outputs.unhealthy != 'true' && steps.scan.outputs.suppressed != 'true'
+        env:
+          RECAP_AGENT: ${{ needs.gate.outputs.agent }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("fs");
+          const path = require("path");
+
+          const sourcePath = path.resolve("recap-source.json");
+          const statPath = path.resolve("recap.stat");
+          const eventPath = process.env.GITHUB_EVENT_PATH;
+
+          function validSource(value) {
+            if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+            if (value.title !== undefined && typeof value.title !== "string") return false;
+            if (value.brief !== undefined && typeof value.brief !== "string") return false;
+            if (!value.mdx || typeof value.mdx !== "object" || Array.isArray(value.mdx)) return false;
+            return typeof value.mdx["plan.mdx"] === "string" && value.mdx["plan.mdx"].trim().length > 0;
+          }
+
+          let reason = "";
+          try {
+            const existing = JSON.parse(fs.readFileSync(sourcePath, "utf8"));
+            if (validSource(existing)) {
+              fs.appendFileSync(process.env.GITHUB_OUTPUT, "fallback=false\n");
+              process.exit(0);
+            }
+            reason = "recap-source.json existed but did not match the expected recap source shape.";
+          } catch (error) {
+            reason = fs.existsSync(sourcePath)
+              ? `recap-source.json was not valid JSON: ${error instanceof Error ? error.message : String(error)}`
+              : "recap-source.json was not created by the agent.";
+          }
+
+          let pr = {};
+          try {
+            pr = JSON.parse(fs.readFileSync(eventPath, "utf8")).pull_request || {};
+          } catch {
+            pr = {};
+          }
+
+          const repo = process.env.GITHUB_REPOSITORY || "unknown/repo";
+          const prNumber = process.env.PR_NUMBER || "";
+          const head = (process.env.HEAD_SHA || "").slice(0, 12) || "unknown";
+          const agent = process.env.RECAP_AGENT || "agent";
+          const rawTitle = process.env.PR_TITLE || pr.title || `PR #${prNumber}`;
+          const title = `Visual recap fallback: ${rawTitle}`.slice(0, 120);
+          const brief = "Fallback recap generated because the coding agent did not produce recap-source.json.";
+          const sourceUrl = pr.html_url || (prNumber ? `https://github.com/${repo}/pull/${prNumber}` : "");
+          const stat = fs.existsSync(statPath)
+            ? fs.readFileSync(statPath, "utf8").trim().slice(0, 6000)
+            : "No diff stat was available.";
+
+          const mdx = [
+            "---",
+            `title: ${JSON.stringify(title)}`,
+            `brief: ${JSON.stringify(brief)}`,
+            "---",
+            "",
+            `# ${title}`,
+            "",
+            brief,
+            "",
+            "## Diagnostic",
+            "",
+            `- Agent: \`${agent}\``,
+            `- Reason: ${reason}`,
+            `- Repository: \`${repo}\``,
+            `- Pull request: ${sourceUrl ? `[${prNumber || "source"}](${sourceUrl})` : prNumber || "unknown"}`,
+            `- Head: \`${head}\``,
+            "",
+            "## Changed Files",
+            "",
+            "```text",
+            stat,
+            "```",
+            "",
+            "## Review Notes",
+            "",
+            "This fallback is intentionally conservative. It confirms the PR diff was collected and keeps the recap pipeline end-to-end, but it does not replace a full agent-authored visual review. Re-run Visual Recap after the agent credential or model quota issue is resolved for a richer recap.",
+            "",
+          ].join("\n");
+
+          fs.writeFileSync(sourcePath, JSON.stringify({ title, brief, mdx: { "plan.mdx": mdx } }, null, 2) + "\n");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, "fallback=true\n");
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `reason<<__RECAP_FALLBACK_REASON__\n${reason}\n__RECAP_FALLBACK_REASON__\n`);
+          console.log(`Wrote fallback ${sourcePath}: ${reason}`);
+          NODE
 
       - name: Publish recap source
         id: publish
