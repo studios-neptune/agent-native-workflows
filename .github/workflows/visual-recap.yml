@@ -817,6 +817,7 @@ jobs:
         id: shot
         if: steps.url.outputs.ok == 'true'
         continue-on-error: true
+        timeout-minutes: 8
         env:
           PLAN_URL: ${{ steps.url.outputs.plan_url }}
         run: |
