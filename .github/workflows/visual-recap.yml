@@ -948,3 +948,21 @@ jobs:
             --failure-summary "$RECAP_AGENT_SUMMARY" \
             --url-reason "$RECAP_URL_REASON" \
             --workflow-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+
+      - name: Fail on fallback recap source
+        if: always() && !cancelled() && steps.fallback_source.outputs.fallback == 'true'
+        env:
+          RECAP_AGENT: ${{ needs.gate.outputs.agent }}
+          RECAP_FALLBACK_REASON: ${{ steps.fallback_source.outputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "::error::Visual recap used the deterministic fallback instead of an agent-authored recap-source.json."
+          if [ -n "${RECAP_FALLBACK_REASON:-}" ]; then
+            echo "::error::Fallback reason: $RECAP_FALLBACK_REASON"
+          fi
+          if [ "${RECAP_AGENT:-}" = "codex" ] && [ -f codex-stderr.log ]; then
+            if grep -Eiq 'refresh_token_invalidated|token_expired|refresh token was revoked|Please log out and sign in again' codex-stderr.log; then
+              echo "::error::Codex auth token is expired or revoked. Renew CODEX_AUTH_JSON_B64 in the caller repository secrets, then rerun Visual Recap."
+            fi
+          fi
+          exit 1
