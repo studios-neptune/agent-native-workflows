@@ -98,6 +98,10 @@ on:
 # Concurrency key uses the caller's PR number so parallel pushes to the same
 # PR cancel the older run.  workflow_call inherits the caller's event context,
 # so github.event.pull_request.number resolves correctly here.
+concurrency:
+  group: visual-recap-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   gate:
     name: Gate
