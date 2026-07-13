@@ -75,10 +75,55 @@ on:
         type: string
         default: "high-confidence"
       runner-labels:
-        description: 'JSON array for the runner labels used by visual recap jobs, for example ["ubuntu-latest"] or ["self-hosted","bootstrap"]'
+        description: 'JSON array for orchestration runner labels; also used by recap when runner-mode=static, for example ["ubuntu-latest"] or ["self-hosted","bootstrap"]'
         required: false
         type: string
         default: '["ubuntu-latest"]'
+      runner-mode:
+        description: "Where to run the heavy recap job: static (runner-labels) or ec2 (ephemeral runner)"
+        required: false
+        type: string
+        default: "static"
+      aws-region:
+        description: "AWS region used when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-image-id:
+        description: "EC2 AMI ID used when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-instance-type:
+        description: "EC2 instance type used when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-subnet-id:
+        description: "EC2 subnet ID used when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-security-group-id:
+        description: "EC2 security group ID used when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-runner-home-dir:
+        description: "Runner home dir used by machulav/ec2-github-runner when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-iam-role-name:
+        description: "Instance profile role name attached to the ephemeral recap runner when runner-mode=ec2"
+        required: false
+        type: string
+        default: ""
+      ec2-runner-name:
+        description: "Name tag for the ephemeral recap runner when runner-mode=ec2"
+        required: false
+        type: string
+        default: "visual-recap-runner"
     secrets:
       # Required: bearer token minted by `agent-native connect`.  Authorizes
       # publishing the recap plan and the screenshot upload.
@@ -99,6 +144,12 @@ on:
       # Must match the plan-url input origin.
       PLAN_RECAP_APP_URL:
         required: false
+      # Required when runner-mode=ec2. Used only on the bootstrap orchestration
+      # jobs to create and clean up the ephemeral self-hosted runner.
+      RUNNER_PAT:
+        required: false
+      AWS_CI_RUNNER_ROLE_ARN:
+        required: false
 
 # Concurrency key uses the caller's PR number so parallel pushes to the same
 # PR cancel the older run.  workflow_call inherits the caller's event context,
@@ -110,7 +161,7 @@ concurrency:
 jobs:
   gate:
     name: Gate
-    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    runs-on: ${{ fromJSON(inputs['runner-labels']) }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -131,6 +182,16 @@ jobs:
           AGENT: ${{ inputs.agent }}
           VISUAL_RECAP_MODEL: ${{ inputs.model }}
           VISUAL_RECAP_SKILL_SOURCE: ${{ inputs.skill-source || 'auto' }}
+          RUNNER_MODE: ${{ inputs['runner-mode'] || 'static' }}
+          HAS_RUNNER_PAT: ${{ secrets.RUNNER_PAT != '' }}
+          HAS_AWS_ROLE: ${{ secrets.AWS_CI_RUNNER_ROLE_ARN != '' }}
+          AWS_REGION_INPUT: ${{ inputs['aws-region'] }}
+          EC2_IMAGE_ID: ${{ inputs['ec2-image-id'] }}
+          EC2_INSTANCE_TYPE: ${{ inputs['ec2-instance-type'] }}
+          EC2_SUBNET_ID: ${{ inputs['ec2-subnet-id'] }}
+          EC2_SECURITY_GROUP_ID: ${{ inputs['ec2-security-group-id'] }}
+          EC2_RUNNER_HOME_DIR: ${{ inputs['ec2-runner-home-dir'] }}
+          EC2_IAM_ROLE_NAME: ${{ inputs['ec2-iam-role-name'] }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         with:
           script: |
@@ -188,6 +249,26 @@ jobs:
               reasons.push('invalid skill-source input value (expected "auto", "latest", or "repo")');
             }
             const usesRepoSkill = skillSource === 'repo';
+
+            const runnerMode = (process.env.RUNNER_MODE || 'static').toLowerCase();
+            if (!['static', 'ec2'].includes(runnerMode)) {
+              reasons.push(`unsupported runner-mode input "${process.env.RUNNER_MODE}" (expected "static" or "ec2")`);
+            }
+            if (runnerMode === 'ec2') {
+              if (process.env.HAS_RUNNER_PAT !== 'true') reasons.push('RUNNER_PAT not configured (ec2 runner mode)');
+              if (process.env.HAS_AWS_ROLE !== 'true') reasons.push('AWS_CI_RUNNER_ROLE_ARN not configured (ec2 runner mode)');
+              for (const [name, value] of [
+                ['aws-region', process.env.AWS_REGION_INPUT],
+                ['ec2-image-id', process.env.EC2_IMAGE_ID],
+                ['ec2-instance-type', process.env.EC2_INSTANCE_TYPE],
+                ['ec2-subnet-id', process.env.EC2_SUBNET_ID],
+                ['ec2-security-group-id', process.env.EC2_SECURITY_GROUP_ID],
+                ['ec2-runner-home-dir', process.env.EC2_RUNNER_HOME_DIR],
+                ['ec2-iam-role-name', process.env.EC2_IAM_ROLE_NAME],
+              ]) {
+                if (!value) reasons.push(`${name} input not configured (ec2 runner mode)`);
+              }
+            }
 
             // Self-modifying guard: skip if the PR touches repo-pinned skill
             // instructions or any agent config the runner loads. With the
@@ -276,11 +357,72 @@ jobs:
               }
             }
 
-  recap:
-    name: Generate visual recap
+  recap_runner:
+    name: Start visual recap runner
     needs: gate
     if: needs.gate.outputs.run == 'true'
-    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    runs-on: ${{ fromJSON(inputs['runner-labels']) }}
+    timeout-minutes: 8
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      runs_on: ${{ steps.select.outputs.runs_on }}
+      label: ${{ steps.start.outputs.label }}
+      ec2_instance_id: ${{ steps.start.outputs.ec2-instance-id }}
+    steps:
+      - name: Select static recap runner
+        id: static
+        if: inputs['runner-mode'] == 'static'
+        run: echo "runs_on=${{ inputs['runner-labels'] }}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        if: inputs['runner-mode'] == 'ec2'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_RUNNER_ROLE_ARN }}
+          aws-region: ${{ inputs['aws-region'] }}
+
+      - name: Start EC2 recap runner
+        id: start
+        if: inputs['runner-mode'] == 'ec2'
+        uses: machulav/ec2-github-runner@v2
+        with:
+          mode: start
+          github-token: ${{ secrets.RUNNER_PAT }}
+          ec2-image-id: ${{ inputs['ec2-image-id'] }}
+          ec2-instance-type: ${{ inputs['ec2-instance-type'] }}
+          subnet-id: ${{ inputs['ec2-subnet-id'] }}
+          security-group-id: ${{ inputs['ec2-security-group-id'] }}
+          runner-home-dir: ${{ inputs['ec2-runner-home-dir'] }}
+          iam-role-name: ${{ inputs['ec2-iam-role-name'] }}
+          startup-quiet-period-seconds: 10
+          startup-retry-interval-seconds: 5
+          aws-resource-tags: >
+            [
+              {"Key": "Name",    "Value": "${{ inputs['ec2-runner-name'] }}"},
+              {"Key": "Repo",    "Value": "${{ github.repository }}"}
+            ]
+
+      - name: Select recap runner labels
+        id: select
+        env:
+          RUNNER_MODE: ${{ inputs['runner-mode'] }}
+          STATIC_RUNS_ON: ${{ steps.static.outputs.runs_on }}
+          EC2_LABEL: ${{ steps.start.outputs.label }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_MODE" = "ec2" ]; then
+            node -e 'process.stdout.write(`runs_on=${JSON.stringify([process.env.EC2_LABEL])}\n`)' >> "$GITHUB_OUTPUT"
+          else
+            echo "runs_on=$STATIC_RUNS_ON" >> "$GITHUB_OUTPUT"
+          fi
+
+  recap:
+    name: Generate visual recap
+    needs: [gate, recap_runner]
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ${{ fromJSON(needs.recap_runner.outputs.runs_on) }}
     timeout-minutes: 30
     permissions:
       actions: write
@@ -975,3 +1117,50 @@ jobs:
             fi
           fi
           exit 1
+
+  stop_recap_runner:
+    name: Stop visual recap runner
+    needs: [recap_runner, recap]
+    if: always() && inputs['runner-mode'] == 'ec2' && needs.recap_runner.outputs.label != ''
+    runs-on: ${{ fromJSON(inputs['runner-labels']) }}
+    timeout-minutes: 5
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Remove GitHub runner registration
+        uses: actions/github-script@v7
+        timeout-minutes: 1
+        continue-on-error: true
+        env:
+          RUNNER_LABEL: ${{ needs.recap_runner.outputs.label }}
+        with:
+          github-token: ${{ secrets.RUNNER_PAT }}
+          script: |
+            const label = process.env.RUNNER_LABEL;
+            const { owner, repo } = context.repo;
+            const runners = await github.paginate(github.rest.actions.listSelfHostedRunnersForRepo, { owner, repo, per_page: 100 });
+            const runner = runners.find((candidate) => candidate.labels.some((runnerLabel) => runnerLabel.name === label));
+            if (!runner) {
+              core.info(`GitHub self-hosted runner with label ${label} is not found`);
+              return;
+            }
+            await github.rest.actions.deleteSelfHostedRunnerFromRepo({ owner, repo, runner_id: runner.id });
+            core.info(`GitHub self-hosted runner ${runner.name} is removed`);
+
+      - name: Configure AWS credentials
+        if: always()
+        uses: aws-actions/configure-aws-credentials@v4
+        timeout-minutes: 1
+        continue-on-error: true
+        with:
+          role-to-assume: ${{ secrets.AWS_CI_RUNNER_ROLE_ARN }}
+          aws-region: ${{ inputs['aws-region'] }}
+
+      - name: Request EC2 runner termination
+        if: always()
+        timeout-minutes: 1
+        continue-on-error: true
+        env:
+          EC2_INSTANCE_ID: ${{ needs.recap_runner.outputs.ec2_instance_id }}
+        run: aws ec2 terminate-instances --region "${{ inputs['aws-region'] }}" --instance-ids "${EC2_INSTANCE_ID}" >/dev/null
