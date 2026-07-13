@@ -124,6 +124,11 @@ on:
         required: false
         type: string
         default: "visual-recap-runner"
+      ec2-project-tag:
+        description: "Project tag for the ephemeral recap runner when runner-mode=ec2"
+        required: false
+        type: string
+        default: "agent-native"
     secrets:
       # Required: bearer token minted by `agent-native connect`.  Authorizes
       # publishing the recap plan and the screenshot upload.
@@ -401,6 +406,7 @@ jobs:
           aws-resource-tags: >
             [
               {"Key": "Name",    "Value": "${{ inputs['ec2-runner-name'] }}"},
+              {"Key": "Project", "Value": "${{ inputs['ec2-project-tag'] }}"},
               {"Key": "Repo",    "Value": "${{ github.repository }}"}
             ]
 
