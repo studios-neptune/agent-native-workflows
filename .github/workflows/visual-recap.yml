@@ -74,6 +74,11 @@ on:
         required: false
         type: string
         default: "high-confidence"
+      runner-labels:
+        description: 'JSON array for the runner labels used by visual recap jobs, for example ["ubuntu-latest"] or ["self-hosted","bootstrap"]'
+        required: false
+        type: string
+        default: '["ubuntu-latest"]'
     secrets:
       # Required: bearer token minted by `agent-native connect`.  Authorizes
       # publishing the recap plan and the screenshot upload.
@@ -105,7 +110,7 @@ concurrency:
 jobs:
   gate:
     name: Gate
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 10
     permissions:
       contents: read
@@ -275,7 +280,7 @@ jobs:
     name: Generate visual recap
     needs: gate
     if: needs.gate.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
     timeout-minutes: 30
     permissions:
       actions: write
